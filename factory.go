@@ -13,7 +13,9 @@ import (
 )
 
 const (
-	defaultScheme = "Bearer"
+	defaultDbUser         = "postgres"
+	defaultDbAddr         = "127.0.0.1:5432"
+	defaultUpdateInterval = 5000
 )
 
 // NewFactory creates a factory for the static bearer token Authenticator extension.
@@ -28,7 +30,11 @@ func NewFactory() extension.Factory {
 
 func createDefaultConfig() component.Config {
 	return &Config{
-		Scheme: defaultScheme,
+		DbUser:         defaultDbUser,
+		DbPassword:     "",
+		DbName:         "",
+		DbAddr:         defaultDbAddr,
+		UpdateInterval: defaultUpdateInterval,
 	}
 }
 

@@ -7,62 +7,81 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
-	"os"
+	"strconv"
 	"sync"
+	"time"
 
-	"github.com/fsnotify/fsnotify"
+	"go.opentelemetry.io/collector/client"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/extension/auth"
 	"go.uber.org/zap"
-	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+
+	pg "github.com/go-pg/pg/v10"
 )
 
-var _ credentials.PerRPCCredentials = (*PerRPCAuth)(nil)
+// var _ credentials.PerRPCCredentials = (*PerRPCAuth)(nil)
 
-// PerRPCAuth is a gRPC credentials.PerRPCCredentials implementation that returns an 'authorization' header.
-type PerRPCAuth struct {
-	metadata map[string]string
-}
+// // PerRPCAuth is a gRPC credentials.PerRPCCredentials implementation that returns an 'authorization' header.
+// type PerRPCAuth struct {
+// 	metadata map[string]string
+// }
 
-// GetRequestMetadata returns the request metadata to be used with the RPC.
-func (c *PerRPCAuth) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
-	return c.metadata, nil
-}
+// // GetRequestMetadata returns the request metadata to be used with the RPC.
+// func (c *PerRPCAuth) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+// 	return c.metadata, nil
+// }
 
-// RequireTransportSecurity always returns true for this implementation. Passing bearer tokens in plain-text connections is a bad idea.
-func (c *PerRPCAuth) RequireTransportSecurity() bool {
-	return true
-}
+// // RequireTransportSecurity always returns true for this implementation. Passing bearer tokens in plain-text connections is a bad idea.
+// func (c *PerRPCAuth) RequireTransportSecurity() bool {
+// 	return true
+// }
 
 var (
-	_ auth.Server = (*BearerTokenAuth)(nil)
-	_ auth.Client = (*BearerTokenAuth)(nil)
+	_  auth.Server = (*BearerTokenAuth)(nil)
+	db *pg.DB
+	m  map[string]*TokenData
 )
 
 // BearerTokenAuth is an implementation of auth.Client. It embeds a static authorization "bearer" token in every rpc call.
 type BearerTokenAuth struct {
-	muTokenString sync.RWMutex
-	scheme        string
-	tokenString   string
+	dbUser         string
+	dbPassword     string
+	dbName         string
+	dbAddr         string
+	updateInterval int
 
-	shutdownCH chan struct{}
+	shutdownCH    chan struct{}
+	muTokenString sync.RWMutex // TODO lock m to update
 
-	filename string
-	logger   *zap.Logger
+	logger *zap.Logger
 }
 
-var _ auth.Client = (*BearerTokenAuth)(nil)
+type Project struct {
+	ID             int32 `pg:",pk"`
+	OrganizationID int32
+}
+
+type Token struct {
+	ProjectID int32
+	Token     string
+	Project   *Project `pg:"rel:has-one"`
+}
+
+type TokenData struct {
+	OrganizationID int32
+	ProjectID      int32
+}
 
 func newBearerTokenAuth(cfg *Config, logger *zap.Logger) *BearerTokenAuth {
-	if cfg.Filename != "" && cfg.BearerToken != "" {
-		logger.Warn("a filename is specified. Configured token is ignored!")
-	}
 	return &BearerTokenAuth{
-		scheme:      cfg.Scheme,
-		tokenString: string(cfg.BearerToken),
-		filename:    cfg.Filename,
-		logger:      logger,
+		dbUser:         cfg.DbUser,
+		dbPassword:     cfg.DbPassword,
+		dbName:         cfg.DbName,
+		dbAddr:         cfg.DbAddr,
+		updateInterval: cfg.UpdateInterval,
+
+		logger: logger,
 	}
 }
 
@@ -70,80 +89,79 @@ func newBearerTokenAuth(cfg *Config, logger *zap.Logger) *BearerTokenAuth {
 // is specified. Otherwise a routine is started to monitor the file containing
 // the token to be transferred.
 func (b *BearerTokenAuth) Start(ctx context.Context, _ component.Host) error {
-	if b.filename == "" {
-		return nil
+	db = pg.Connect(&pg.Options{
+		User:     b.dbUser,
+		Password: b.dbPassword,
+		Database: b.dbName,
+		Addr:     b.dbAddr,
+	})
+
+	b.logger.Info("Connection to database established")
+
+	var tokens []Token
+	err := db.Model(&tokens).Relation("Project").Select()
+	if err != nil {
+		return err
 	}
+
+	b.logger.Info(fmt.Sprintf("Tokens fetched length %d", len(tokens)))
+
+	m = make(map[string]*TokenData)
+
+	for _, token := range tokens {
+		m[token.Token] = &TokenData{
+			OrganizationID: token.Project.OrganizationID,
+			ProjectID:      token.ProjectID,
+		}
+	}
+	b.logger.Info("Tokens pushed")
 
 	if b.shutdownCH != nil {
 		return fmt.Errorf("bearerToken file monitoring is already running")
 	}
 
-	// Read file once
-	b.refreshToken()
-
 	b.shutdownCH = make(chan struct{})
 
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return err
-	}
-	// start file watcher
-	go b.startWatcher(ctx, watcher)
+	go b.startPeriodicUpdate(ctx)
 
-	return watcher.Add(b.filename)
+	return nil
 }
 
-func (b *BearerTokenAuth) startWatcher(ctx context.Context, watcher *fsnotify.Watcher) {
-	defer watcher.Close()
+func (b *BearerTokenAuth) startPeriodicUpdate(ctx context.Context) {
 	for {
 		select {
 		case _, ok := <-b.shutdownCH:
 			_ = ok
+			b.logger.Info("shutdownCH handled")
 			return
 		case <-ctx.Done():
+			b.logger.Info("Done handled")
 			return
-		case event, ok := <-watcher.Events:
-			if !ok {
-				continue
-			}
-			// NOTE: k8s configmaps uses symlinks, we need this workaround.
-			// original configmap file is removed.
-			// SEE: https://martensson.io/go-fsnotify-and-kubernetes-configmaps/
-			if event.Op == fsnotify.Remove || event.Op == fsnotify.Chmod {
-				// remove the watcher since the file is removed
-				if err := watcher.Remove(event.Name); err != nil {
-					b.logger.Error(err.Error())
-				}
-				// add a new watcher pointing to the new symlink/file
-				if err := watcher.Add(b.filename); err != nil {
-					b.logger.Error(err.Error())
-				}
-				b.refreshToken()
-			}
-			// also allow normal files to be modified and reloaded.
-			if event.Op == fsnotify.Write {
-				b.refreshToken()
-			}
+		default:
+			// DO update
+			b.logger.Info("update...")
+			time.Sleep(time.Duration(b.updateInterval) * time.Millisecond)
 		}
 	}
 }
 
-func (b *BearerTokenAuth) refreshToken() {
-	b.logger.Info("refresh token", zap.String("filename", b.filename))
-	token, err := os.ReadFile(b.filename)
-	if err != nil {
-		b.logger.Error(err.Error())
-		return
-	}
-	b.muTokenString.Lock()
-	b.tokenString = string(token)
-	b.muTokenString.Unlock()
-}
+// func (b *BearerTokenAuth) refreshToken() {
+// 	b.logger.Info("refresh token", zap.String("filename", b.filename))
+// 	token, err := os.ReadFile(b.filename)
+// 	if err != nil {
+// 		b.logger.Error(err.Error())
+// 		return
+// 	}
+// 	b.muTokenString.Lock()
+// 	b.tokenString = string(token)
+// 	b.muTokenString.Unlock()
+// }
 
 // Shutdown of BearerTokenAuth does nothing and returns nil
 func (b *BearerTokenAuth) Shutdown(_ context.Context) error {
-	if b.filename == "" {
-		return nil
+	if db != nil {
+		db.Close()
+		b.logger.Info("Connection to database closed")
 	}
 
 	if b.shutdownCH == nil {
@@ -152,33 +170,14 @@ func (b *BearerTokenAuth) Shutdown(_ context.Context) error {
 	b.shutdownCH <- struct{}{}
 	close(b.shutdownCH)
 	b.shutdownCH = nil
+
 	return nil
-}
-
-// PerRPCCredentials returns PerRPCAuth an implementation of credentials.PerRPCCredentials that
-func (b *BearerTokenAuth) PerRPCCredentials() (credentials.PerRPCCredentials, error) {
-	return &PerRPCAuth{
-		metadata: map[string]string{"authorization": b.bearerToken()},
-	}, nil
-}
-
-func (b *BearerTokenAuth) bearerToken() string {
-	b.muTokenString.RLock()
-	token := fmt.Sprintf("%s %s", b.scheme, b.tokenString)
-	b.muTokenString.RUnlock()
-	return token
-}
-
-// RoundTripper is not implemented by BearerTokenAuth
-func (b *BearerTokenAuth) RoundTripper(base http.RoundTripper) (http.RoundTripper, error) {
-	return &BearerAuthRoundTripper{
-		baseTransport:   base,
-		bearerTokenFunc: b.bearerToken,
-	}, nil
 }
 
 // Authenticate checks whether the given context contains valid auth data.
 func (b *BearerTokenAuth) Authenticate(ctx context.Context, headers map[string][]string) (context.Context, error) {
+	fmt.Println("----------- Authenticate called")
+
 	auth, ok := headers["authorization"]
 	if !ok {
 		auth, ok = headers["Authorization"]
@@ -187,28 +186,30 @@ func (b *BearerTokenAuth) Authenticate(ctx context.Context, headers map[string][
 		return ctx, errors.New("authentication didn't succeed")
 	}
 	token := auth[0]
-	expect := b.tokenString
-	if len(b.scheme) != 0 {
-		expect = fmt.Sprintf("%s %s", b.scheme, expect)
-	}
-	if expect != token {
-		return ctx, fmt.Errorf("scheme or token does not match: %s", token)
-	}
-	return ctx, nil
-}
 
-// BearerAuthRoundTripper intercepts and adds Bearer token Authorization headers to each http request.
-type BearerAuthRoundTripper struct {
-	baseTransport   http.RoundTripper
-	bearerTokenFunc func() string
-}
-
-// RoundTrip modifies the original request and adds Bearer token Authorization headers.
-func (interceptor *BearerAuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	req2 := req.Clone(req.Context())
-	if req2.Header == nil {
-		req2.Header = make(http.Header)
+	value, ok := m[token]
+	if !ok {
+		return ctx, errors.New("authentication didn't succeed")
 	}
-	req2.Header.Set("Authorization", interceptor.bearerTokenFunc())
-	return interceptor.baseTransport.RoundTrip(req2)
+
+	fmt.Println("------------ token value --------------")
+	fmt.Println(value)
+
+	// TODO pass token data next
+
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		// TODO log errors
+		return ctx, errors.New("authentication didn't succeed")
+	}
+
+	tenant := strconv.Itoa(int(value.OrganizationID)) + ":" + strconv.Itoa(int(value.ProjectID))
+
+	// TODO get stack from db
+	md.Set("x-stack", "stack-1")
+	md.Set("x-tenant", tenant)
+
+	cl := client.FromContext(ctx)
+	cl.Metadata = client.NewMetadata(md)
+	return client.NewContext(ctx, cl), nil
 }
