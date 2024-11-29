@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
@@ -57,9 +56,16 @@ type BearerTokenAuth struct {
 	logger *zap.Logger
 }
 
+// type Stack struct {
+// 	ID   int32 `pg:",pk"`
+// 	Name string
+// }
+
 type Project struct {
 	ID             int32 `pg:",pk"`
 	OrganizationID int32
+	StackID        int32
+	// Stack          *Stack `pg:"rel:has-one"`
 }
 
 type Token struct {
@@ -71,6 +77,7 @@ type Token struct {
 type TokenData struct {
 	OrganizationID int32
 	ProjectID      int32
+	StackID        int32
 }
 
 func newBearerTokenAuth(cfg *Config, logger *zap.Logger) *BearerTokenAuth {
@@ -109,9 +116,11 @@ func (b *BearerTokenAuth) Start(ctx context.Context, _ component.Host) error {
 	m = make(map[string]*TokenData)
 
 	for _, token := range tokens {
+		// fmt.Println(token.Project)
 		m[token.Token] = &TokenData{
 			OrganizationID: token.Project.OrganizationID,
 			ProjectID:      token.ProjectID,
+			StackID:        token.Project.StackID,
 		}
 	}
 	b.logger.Info("Tokens pushed")
@@ -203,10 +212,12 @@ func (b *BearerTokenAuth) Authenticate(ctx context.Context, headers map[string][
 		return ctx, errors.New("authentication didn't succeed")
 	}
 
-	tenant := strconv.Itoa(int(value.OrganizationID)) + ":" + strconv.Itoa(int(value.ProjectID))
+	// tenant := strconv.Itoa(int(value.OrganizationID)) + ":" + strconv.Itoa(int(value.ProjectID))
+	// tenant := fmt.Sprintf("%s:%s", strconv.Itoa(int(value.OrganizationID)), strconv.Itoa(int(value.ProjectID)))
+	tenant := fmt.Sprintf("%d:%d", value.OrganizationID, value.ProjectID)
+	stack := fmt.Sprintf("stack-%d", value.StackID)
 
-	// TODO get stack from db
-	md.Set("x-stack", "stack-1")
+	md.Set("x-stack", stack)
 	md.Set("x-tenant", tenant)
 
 	cl := client.FromContext(ctx)
