@@ -56,16 +56,15 @@ type BearerTokenAuth struct {
 	logger *zap.Logger
 }
 
-// type Stack struct {
-// 	ID   int32 `pg:",pk"`
-// 	Name string
-// }
+type Stack struct {
+	ID   int32 `pg:",pk"`
+	Name string
+}
 
 type Project struct {
 	ID             int32 `pg:",pk"`
 	OrganizationID int32
-	StackID        int32
-	// Stack          *Stack `pg:"rel:has-one"`
+	Stack          *Stack `pg:"rel:has-one"`
 }
 
 type Token struct {
@@ -77,7 +76,7 @@ type Token struct {
 type TokenData struct {
 	OrganizationID int32
 	ProjectID      int32
-	StackID        int32
+	StackName      string
 }
 
 func newBearerTokenAuth(cfg *Config, logger *zap.Logger) *BearerTokenAuth {
@@ -106,7 +105,7 @@ func (b *BearerTokenAuth) Start(ctx context.Context, _ component.Host) error {
 	b.logger.Info("Connection to database established")
 
 	var tokens []Token
-	err := db.Model(&tokens).Relation("Project").Select()
+	err := db.Model(&tokens).Relation("Project").Relation("Project.Stack").Select()
 	if err != nil {
 		return err
 	}
@@ -120,7 +119,8 @@ func (b *BearerTokenAuth) Start(ctx context.Context, _ component.Host) error {
 		m[token.Token] = &TokenData{
 			OrganizationID: token.Project.OrganizationID,
 			ProjectID:      token.ProjectID,
-			StackID:        token.Project.StackID,
+			// StackID:        token.Project.StackID,
+			StackName: token.Project.Stack.Name,
 		}
 	}
 	b.logger.Info("Tokens pushed")
@@ -212,13 +212,12 @@ func (b *BearerTokenAuth) Authenticate(ctx context.Context, headers map[string][
 		return ctx, errors.New("authentication didn't succeed")
 	}
 
-	// tenant := strconv.Itoa(int(value.OrganizationID)) + ":" + strconv.Itoa(int(value.ProjectID))
-	// tenant := fmt.Sprintf("%s:%s", strconv.Itoa(int(value.OrganizationID)), strconv.Itoa(int(value.ProjectID)))
 	tenant := fmt.Sprintf("%d:%d", value.OrganizationID, value.ProjectID)
-	stack := fmt.Sprintf("stack-%d", value.StackID)
+	stack := value.StackName
 
 	md.Set("x-stack", stack)
 	md.Set("x-tenant", tenant)
+	fmt.Println(tenant + " " + stack)
 
 	cl := client.FromContext(ctx)
 	cl.Metadata = client.NewMetadata(md)
